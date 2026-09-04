@@ -693,6 +693,12 @@ variable "release_profile" {
   }
 }
 
+variable "release_use_semantic_release" {
+  type        = bool
+  description = "Only meaningful when release_profile = \"action\" and language = \"javascript\". false (default) renders the git-cliff flavor: workflow_dispatch with a manually supplied version, changelog derived from Conventional Commits, language-neutral (works for a Python/Rust/Go composite action). true renders the semantic-release flavor instead: push-to-main triggered, commit-analyzer decides the version bump from Conventional Commits with no contributor action beyond the commit message, and a release is cut automatically whenever a qualifying commit lands, no manual step. Both flavors use the bot App token to bypass the tag-protection ruleset and both move the vMAJOR tag on release. semantic-release requires a package.json/Node toolchain, so this is rejected for non-javascript repos."
+  default     = false
+}
+
 # ─── JS-specific CI knobs ──────────────────────────────────────────────
 
 variable "ci_runtimes" {

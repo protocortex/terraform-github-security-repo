@@ -753,6 +753,10 @@ locals {
   # Single source of truth for "the action release flavor is active in this repo",
   # shared by every action-profile-only resource (workflow, cliff.toml, branch policy).
   _action_release_enabled = var.manage_workflow_release && var.release_profile == "action"
+  # Which flavor of the action release flavor: git-cliff (language-neutral,
+  # default) or semantic-release (javascript-only). Single source of truth
+  # shared by the release workflow, cliff.toml, and .releaserc.json below.
+  _action_release_uses_semantic_release = local._action_release_enabled && var.release_use_semantic_release
 
   # Discoverable list of languages with templated workflows. Used in
   # precondition error messages to tell the operator which values of
@@ -834,28 +838,57 @@ resource "github_repository_file" "workflow_publish" {
 resource "github_repository_file" "workflow_action_release" {
   count = local._action_release_enabled ? 1 : 0
 
-  repository          = github_repository.this.name
-  file                = ".github/workflows/release.yml"
-  branch              = "main"
-  content             = templatefile("${path.module}/workflows/profiles/release.action.yml.tftpl", {})
+  repository = github_repository.this.name
+  file       = ".github/workflows/release.yml"
+  branch     = "main"
+  content = (
+    local._action_release_uses_semantic_release
+    ? templatefile("${path.module}/workflows/profiles/release.action.semantic-release.yml.tftpl", {
+      node_version = var.node_version
+    })
+    : templatefile("${path.module}/workflows/profiles/release.action.yml.tftpl", {})
+  )
   commit_message      = "chore(ci): sync release.yml from the hardened-repo module"
   overwrite_on_create = true
 
-  # No precondition: unlike the language-dispatched templates, this one is always
-  # bundled with the module, so there is nothing to guard against.
   lifecycle {
     ignore_changes = [commit_message, commit_author, commit_email]
+    precondition {
+      condition     = !var.release_use_semantic_release || var.language == "javascript"
+      error_message = "release_use_semantic_release=true requires var.language = \"javascript\" (semantic-release needs a package.json/Node toolchain); use the default git-cliff flavor (release_use_semantic_release = false) for non-javascript action repos."
+    }
   }
 }
 
+# git-cliff config: only rendered for the default (non-semantic-release) flavor.
 resource "github_repository_file" "cliff_config" {
-  count = local._action_release_enabled ? 1 : 0
+  count = local._action_release_enabled && !var.release_use_semantic_release ? 1 : 0
 
   repository          = github_repository.this.name
   file                = "cliff.toml"
   branch              = "main"
   content             = file("${path.module}/cliff.toml")
   commit_message      = "chore(release): sync cliff.toml from the hardened-repo module"
+  overwrite_on_create = true
+
+  lifecycle {
+    ignore_changes = [commit_message, commit_author, commit_email]
+  }
+}
+
+# semantic-release config: only rendered for the semantic-release flavor.
+# package.json's "private": true stays a one-time manual step in the
+# consuming repo (see docs/action-release-flavor.md) -- Terraform doesn't
+# merge into an existing package.json. No devDependencies needed: the
+# workflow installs semantic-release and its plugins fresh in the job.
+resource "github_repository_file" "semantic_release_config" {
+  count = local._action_release_uses_semantic_release ? 1 : 0
+
+  repository          = github_repository.this.name
+  file                = ".releaserc.json"
+  branch              = "main"
+  content             = file("${path.module}/semantic-release/.releaserc.json")
+  commit_message      = "chore(release): sync .releaserc.json from the hardened-repo module"
   overwrite_on_create = true
 
   lifecycle {

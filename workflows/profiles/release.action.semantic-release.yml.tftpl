@@ -1,0 +1,166 @@
+# SPDX-License-Identifier: Apache-2.0
+# Managed by the terraform-github-security-repo module. Do not edit directly:
+#
+# Templated by the hardened-repo module's main.tf (variable
+# manage_workflow_release with release_profile = "action" and
+# release_use_semantic_release = true). Direct edits in the consuming repo
+# are overwritten on the next apply against the hardened-repo module.
+#
+# semantic-release flavor of the standardized action-release pipeline (JS
+# only: semantic-release needs a package.json/Node toolchain, unlike the
+# git-cliff flavor). Triggered on every push to main: commit-analyzer reads
+# Conventional Commits since the last release to decide the bump, no
+# contributor action beyond writing the commit message. When a release is
+# warranted, the job installs the repo's own dependencies, bumps
+# package.json + CHANGELOG.md, builds dist/ (via the exec plugin's
+# prepareCmd, so it runs after npm's version bump and before git's commit)
+# and commits it alongside them, tags vX.Y.Z, publishes a GitHub Release
+# with a build-provenance attestation over the source tarball, and moves
+# the vMAJOR tag.
+#
+# dist/index.js is the file the node24 runtime actually executes for
+# `uses: owner/repo@ref`, and is gitignored everywhere except this release
+# commit: it is deliberately NOT committed on regular pushes to main (see
+# the consuming repo's own CONTRIBUTING.md), so this is the only place it
+# is ever built and committed. check-dist.yml (hand-tuned in the consuming
+# repo, not templated here) verifies it on every pushed release tag.
+#
+# Requirements on the consuming repo (see docs/action-release-flavor.md):
+#   - protect_tag_pattern = "v*" and manage_bot_app_secrets (or org secrets)
+#   - GitHub Immutable Releases DISABLED (moving vMAJOR needs mutable tags)
+#   - Marketplace branding: in action.yml (first publish is a manual UI step)
+#   - package.json: "private": true (so @semantic-release/npm bumps the
+#     version locally without ever attempting `npm publish` or needing npm
+#     registry auth). No semantic-release devDependencies needed: it and
+#     its plugins install fresh in the job. The repo's OWN dependencies
+#     (esbuild etc., needed to build dist/) are installed by this workflow
+#     from its own lockfile, same as ci.yml does.
+#   - a "build" script in package.json that produces dist/index.js
+
+name: release
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency: $${{ github.workflow }}-$${{ github.ref }}
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: step-security/harden-runner@9af89fc71515a100421586dfdb3dc9c984fbf411 # v2.19.4
+        with:
+          egress-policy: block
+          allowed-endpoints: >
+            api.github.com:443
+            github.com:443
+            objects.githubusercontent.com:443
+            uploads.github.com:443
+            release-assets.githubusercontent.com:443
+            codeload.github.com:443
+            registry.npmjs.org:443
+            fulcio.sigstore.dev:443
+            rekor.sigstore.dev:443
+            tuf-repo-cdn.sigstore.dev:443
+
+      # Bot App token: bypasses the branch + release_tags rulesets so the job
+      # can push the release commit directly to main and create/move
+      # protected v* tags.
+      - uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        id: app-token
+        with:
+          app-id: $${{ secrets.BOT_APP_CLIENT_ID }}
+          private-key: $${{ secrets.BOT_APP_PRIVATE_KEY }}
+          permission-contents: write
+
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          token: $${{ steps.app-token.outputs.token }}
+
+      - name: Configure git identity (bot)
+        run: |
+          set -euo pipefail
+          git config user.name '$${{ steps.app-token.outputs.app-slug }}[bot]'
+          git config user.email '$${{ steps.app-token.outputs.app-slug }}[bot]@users.noreply.github.com'
+
+      - run: corepack enable
+
+      - uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: '${node_version}'
+          cache: pnpm
+
+      # Installs the repo's own dependencies (esbuild etc.) from its own
+      # lockfile, same as ci.yml. Needed so the exec plugin's prepareCmd
+      # below (pnpm run build) has a working toolchain; semantic-release
+      # itself and its plugins install separately via extra_plugins, not
+      # from this lockfile.
+      - run: pnpm install --frozen-lockfile
+
+      # @semantic-release/changelog, @semantic-release/exec, and
+      # @semantic-release/git are not bundled with semantic-release core
+      # (commit-analyzer, release-notes-generator, npm, and github are);
+      # pre-install them.
+      - name: Release
+        id: semantic
+        uses: cycjimmy/semantic-release-action@b12c8f6015dc215fe37bc154d4ad456dd3833c90 # v6.0.0
+        with:
+          extra_plugins: |
+            @semantic-release/changelog
+            @semantic-release/exec
+            @semantic-release/git
+        env:
+          GITHUB_TOKEN: $${{ steps.app-token.outputs.token }}
+
+      - name: Package source tarball
+        id: pack
+        if: steps.semantic.outputs.new_release_published == 'true'
+        run: |
+          set -euo pipefail
+          TAG="$${{ steps.semantic.outputs.new_release_git_tag }}"
+          FILE="$${{ github.event.repository.name }}-$${TAG}.tar.gz"
+          git archive --format=tar.gz --prefix="$${TAG}/" -o "$${FILE}" "$${TAG}"
+          sha256sum "$${FILE}" > "$${FILE}.sha256"
+          echo "file=$${FILE}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32 # v4.1.0
+        with:
+          subject-path: $${{ steps.pack.outputs.file }}
+
+      # semantic-release (@semantic-release/github) already created the
+      # GitHub Release with the generated release notes as the body; this
+      # attaches the tarball + checksum, matching by tag_name instead of
+      # creating a second one.
+      - name: Attach assets to GitHub release
+        if: steps.semantic.outputs.new_release_published == 'true'
+        uses: softprops/action-gh-release@718ea10b132b3b2eba29c1007bb80653f286566b # v3.0.1
+        with:
+          tag_name: $${{ steps.semantic.outputs.new_release_git_tag }}
+          files: |
+            $${{ steps.pack.outputs.file }}
+            $${{ steps.pack.outputs.file }}.sha256
+          fail_on_unmatched_files: true
+          token: $${{ steps.app-token.outputs.token }}
+
+      - name: Move major tag
+        if: steps.semantic.outputs.new_release_published == 'true'
+        run: |
+          set -euo pipefail
+          MAJOR="v$${{ steps.semantic.outputs.new_release_major_version }}"
+          git tag -f "$${MAJOR}" "$${{ steps.semantic.outputs.new_release_git_tag }}"
+          git push -f origin "refs/tags/$${MAJOR}"
